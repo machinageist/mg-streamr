@@ -49,14 +49,15 @@ fn base_name(file: &str) -> String {
 }
 
 // Put mpd's status, its current song and any podcast match together for display
+// `podcast` is the episode with its show's title and cover, when the song is one
 pub fn compose(
     status: Status,
     song: Option<Song>,
-    podcast: Option<(crate::store::Episode, Option<String>)>,
+    podcast: Option<(crate::store::Episode, Option<String>, Option<String>)>,
     at: i64,
 ) -> Now {
     let (title, artist, album) = match (&song, &podcast) {
-        (_, Some((episode, show_title))) => (
+        (_, Some((episode, show_title, _))) => (
             episode.title.clone(),
             show_title.clone().unwrap_or_else(|| episode.show.clone()),
             String::new(),
@@ -73,7 +74,7 @@ pub fn compose(
     };
     // a stream's duration is unknown to mpd; a podcast's feed may know it
     let duration = match (&podcast, status.duration) {
-        (Some((episode, _)), d) if d <= 0.0 => episode.duration_seconds.unwrap_or(0) as f64,
+        (Some((episode, _, _)), d) if d <= 0.0 => episode.duration_seconds.unwrap_or(0) as f64,
         (_, d) => d,
     };
     Now {
@@ -88,10 +89,11 @@ pub fn compose(
         artist,
         album,
         file: song.map(|s| s.file),
-        podcast: podcast.map(|(e, _)| PodcastRef {
+        // the episode's own picture, else its show's cover
+        podcast: podcast.map(|(e, _, show_image)| PodcastRef {
             episode_id: e.id,
             show: e.show,
-            image_url: e.image_url,
+            image_url: e.image_url.or(show_image),
         }),
         art: None,
         at,
@@ -104,8 +106,9 @@ pub fn now(mpd: &mut Mpd, store: Option<&Store>) -> Result<Now> {
     let song = mpd.current_song()?;
     let podcast = match (store, &song) {
         (Some(store), Some(song)) => store.episode_by_uri(&song.file)?.map(|episode| {
-            let show_title = store.show(&episode.show).ok().and_then(|s| s.title);
-            (episode, show_title)
+            let show = store.show(&episode.show).ok();
+            let (title, image) = show.map_or((None, None), |s| (s.title, s.image_url));
+            (episode, title, image)
         }),
         _ => None,
     };
@@ -185,7 +188,11 @@ mod tests {
         let pod = compose(
             playing(0.0),
             Some(song("https://cdn.example/1.mp3", None)),
-            Some((episode, Some("The Late Show".into()))),
+            Some((
+                episode,
+                Some("The Late Show".into()),
+                Some("https://cdn.example/show.jpg".into()),
+            )),
             1,
         );
         assert_eq!(
@@ -196,7 +203,13 @@ mod tests {
             pod.duration, 1800.0,
             "a stream's length comes from the feed"
         );
-        assert_eq!(pod.podcast.unwrap().episode_id, 5);
+        let reference = pod.podcast.unwrap();
+        assert_eq!(reference.episode_id, 5);
+        assert_eq!(
+            reference.image_url.as_deref(),
+            Some("https://cdn.example/show.jpg"),
+            "no episode picture: the show's cover"
+        );
     }
 
     #[test]
