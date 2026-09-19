@@ -14,8 +14,10 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use mg_streamr::art;
 use mg_streamr::mpd::{Mpd, Song, parse_songs};
 use mg_streamr::player::{self, Now};
+use mg_streamr::podcast;
 use mg_streamr::store::{self, Store};
 
 // mpd areas whose changes the status reflects
@@ -69,6 +71,50 @@ enum Command {
     },
     /// Print the status again on every change, one JSON line each
     Watch,
+    /// Podcasts: subscribe, list, refresh, episodes, play, download
+    Podcast {
+        #[command(subcommand)]
+        action: PodcastAction,
+    },
+    /// Path of the cached cover for what is playing
+    Art,
+    /// Remember where each podcast episode was left (run by the user unit)
+    Daemon,
+}
+
+#[derive(Subcommand)]
+enum PodcastAction {
+    /// Subscribe to a feed under a short name (letters, digits, - _ .)
+    Add {
+        name: String,
+        url: String,
+    },
+    List,
+    /// Fetch one show's feed again, or every show's
+    Refresh {
+        name: Option<String>,
+    },
+    Episodes {
+        name: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Play an episode, resuming where it was left
+    Play {
+        id: i64,
+    },
+    /// Save an episode into ~/music/podcasts/<show>/ for offline play
+    Download {
+        id: i64,
+    },
+    /// Delete a downloaded episode's file
+    RemoveDownload {
+        id: i64,
+    },
+    /// Unsubscribe (downloaded files stay until removed)
+    Forget {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -127,9 +173,24 @@ fn run(cli: Cli) -> Result<()> {
     if matches!(cli.command, Command::Watch) {
         return watch();
     }
+    if matches!(cli.command, Command::Daemon) {
+        return daemon();
+    }
+    if let Command::Podcast { action } = cli.command {
+        return podcast(json, action);
+    }
     let mut mpd = Mpd::connect_default()?;
     match cli.command {
-        Command::Status => show_now(json, &player::now(&mut mpd, podcasts().as_ref())?),
+        Command::Status => show_now(json, &now_with_art(&mut mpd, podcasts().as_ref())?),
+        Command::Art => {
+            let now = now_with_art(&mut mpd, podcasts().as_ref())?;
+            if json {
+                println!("{}", json!({ "art": now.art }));
+            } else if let Some(path) = now.art {
+                println!("{path}");
+            }
+            Ok(())
+        }
         Command::Play { pos } => {
             match pos {
                 Some(p) => mpd.run("play", &[&p.to_string()])?,
@@ -199,7 +260,173 @@ fn run(cli: Cli) -> Result<()> {
             }
             LibraryAction::Update => act(json, &mut mpd, "update", &[]),
         },
-        Command::Watch => unreachable!("handled above"),
+        Command::Watch | Command::Daemon | Command::Podcast { .. } => unreachable!("handled above"),
+    }
+}
+
+// The status with its cover filled in (a missing or failed cover is simply none)
+fn now_with_art(mpd: &mut Mpd, store: Option<&Store>) -> Result<Now> {
+    let mut now = player::now(mpd, store)?;
+    now.art = art::cover(mpd, &now, &art::default_dir())
+        .ok()
+        .flatten()
+        .map(|p| p.display().to_string());
+    Ok(now)
+}
+
+// where mpd's library is; podcast downloads go inside it so mpd can play them
+fn music_dir() -> std::path::PathBuf {
+    dirs::home_dir().unwrap_or_default().join("music")
+}
+
+// Everything under `mg-streamr podcast …`
+fn podcast(json: bool, action: PodcastAction) -> Result<()> {
+    let store = Store::open(store::default_path())?;
+    let print = |value: serde_json::Value, text: String| {
+        if json {
+            println!("{value}");
+        } else {
+            println!("{text}");
+        }
+    };
+    match action {
+        PodcastAction::Add { name, url } => {
+            let (show, added) = podcast::subscribe(&store, &name, &url)?;
+            print(
+                json!({ "ok": true, "show": show, "added": added }),
+                format!(
+                    "{} subscribed: {added} episodes",
+                    show.title.clone().unwrap_or(show.name.clone())
+                ),
+            );
+        }
+        PodcastAction::List => {
+            let shows = store.shows()?;
+            if json {
+                println!("{}", serde_json::to_string(&shows)?);
+            } else {
+                for s in &shows {
+                    println!(
+                        "{:<20} {:>4} episodes, {:>3} new  {}",
+                        s.name,
+                        s.episodes,
+                        s.unplayed,
+                        s.title.as_deref().unwrap_or("")
+                    );
+                }
+            }
+        }
+        PodcastAction::Refresh { name } => {
+            let names: Vec<String> = match name {
+                Some(n) => vec![n],
+                None => store.shows()?.into_iter().map(|s| s.name).collect(),
+            };
+            let mut results = Vec::new();
+            for n in names {
+                // one broken feed should not stop the rest
+                match podcast::refresh(&store, &n) {
+                    Ok(added) => results.push(json!({ "show": n, "added": added })),
+                    Err(e) => results.push(json!({ "show": n, "error": format!("{e:#}") })),
+                }
+            }
+            print(
+                json!({ "ok": true, "results": results }),
+                results
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        PodcastAction::Episodes { name, limit } => {
+            let episodes = store.episodes(&name, limit)?;
+            if json {
+                println!("{}", serde_json::to_string(&episodes)?);
+            } else {
+                for e in &episodes {
+                    let mark = if e.played { " " } else { "\u{2022}" };
+                    let at = if e.position_seconds > 0.0 && !e.played {
+                        format!("  at {}", player::clock(e.position_seconds))
+                    } else {
+                        String::new()
+                    };
+                    let saved = if e.download_path.is_some() {
+                        "  [saved]"
+                    } else {
+                        ""
+                    };
+                    println!("{mark} {:>6}  {}{at}{saved}", e.id, e.title);
+                }
+            }
+        }
+        PodcastAction::Play { id } => {
+            let mut mpd = Mpd::connect_default()?;
+            let episode = podcast::play(&store, &mut mpd, id)?;
+            print(
+                json!({ "ok": true, "episode": episode.id }),
+                format!("playing {}", episode.title),
+            );
+        }
+        PodcastAction::Download { id } => {
+            let path = podcast::download(&store, id, &music_dir())?;
+            // tell mpd the file is there so it can play it
+            if let Ok(mut mpd) = Mpd::connect_default() {
+                let folder = path.rsplit_once('/').map_or(path.as_str(), |(dir, _)| dir);
+                let _ = mpd.run("update", &[folder]);
+            }
+            print(
+                json!({ "ok": true, "path": path }),
+                format!("saved to ~/music/{path}"),
+            );
+        }
+        PodcastAction::RemoveDownload { id } => {
+            podcast::remove_download(&store, id, &music_dir())?;
+            print(
+                json!({ "ok": true }),
+                format!("removed episode {id}'s file"),
+            );
+        }
+        PodcastAction::Forget { name } => {
+            store.forget(&name)?;
+            print(json!({ "ok": true }), format!("unsubscribed from {name}"));
+        }
+    }
+    Ok(())
+}
+
+// how often the daemon notes where a playing episode is
+const RECORD_EVERY: Duration = Duration::from_secs(10);
+
+// Note where the playing podcast episode is every few seconds, forever; mpd going away is waited out
+fn daemon() -> Result<()> {
+    let store = Store::open(store::default_path())?;
+    let mut mpd: Option<Mpd> = None;
+    loop {
+        if mpd.is_none() {
+            mpd = Mpd::connect_default().ok();
+        }
+        if let Some(connection) = mpd.as_mut() {
+            match player::now(connection, Some(&store)) {
+                Ok(now) => {
+                    if let Some(p) = &now.podcast {
+                        let duration = if now.duration > 0.0 {
+                            Some(now.duration as i64)
+                        } else {
+                            None
+                        };
+                        if let Some((at, heard)) =
+                            podcast::progress(&now.state, now.elapsed, duration)
+                            && let Err(e) = store.set_position(p.episode_id, at, heard)
+                        {
+                            eprintln!("mg-streamr: could not save the position: {e:#}");
+                        }
+                    }
+                }
+                // a dropped connection: forget it and connect again next time
+                Err(_) => mpd = None,
+            }
+        }
+        std::thread::sleep(RECORD_EVERY);
     }
 }
 
@@ -290,7 +517,7 @@ fn watch() -> Result<()> {
             let mut waiter = Mpd::connect_default()?;
             let mut asker = Mpd::connect_default()?;
             loop {
-                let now = player::now(&mut asker, store.as_ref())?;
+                let now = now_with_art(&mut asker, store.as_ref())?;
                 // a closed pipe means the shell stopped listening: end quietly
                 if writeln!(out, "{}", serde_json::to_string(&now)?)
                     .and_then(|_| out.flush())
