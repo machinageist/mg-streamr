@@ -8,3 +8,4 @@ pub mod mpd;
 pub mod player;
 pub mod podcast;
 pub mod store;
+pub mod tui;

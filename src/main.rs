@@ -80,6 +80,8 @@ enum Command {
     Art,
     /// Remember where each podcast episode was left (run by the user unit)
     Daemon,
+    /// The player in the terminal
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -176,6 +178,9 @@ fn run(cli: Cli) -> Result<()> {
     if matches!(cli.command, Command::Daemon) {
         return daemon();
     }
+    if matches!(cli.command, Command::Tui) {
+        return mg_streamr::tui::run();
+    }
     if let Command::Podcast { action } = cli.command {
         return podcast(json, action);
     }
@@ -260,7 +265,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             LibraryAction::Update => act(json, &mut mpd, "update", &[]),
         },
-        Command::Watch | Command::Daemon | Command::Podcast { .. } => unreachable!("handled above"),
+        Command::Watch | Command::Daemon | Command::Tui | Command::Podcast { .. } => {
+            unreachable!("handled above")
+        }
     }
 }
 

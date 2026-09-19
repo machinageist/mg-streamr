@@ -12,6 +12,7 @@ clap = { version = "4.5", features = ["derive"] }
 dirs = "5"
 # feeds and downloads go through mg-brief's guarded network path (one hardened path for the suite)
 mg-brief = { path = "../mg-briefr" }
+ratatui = "0.29"
 # the version mg-brief links; two would clash over libsqlite3
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
