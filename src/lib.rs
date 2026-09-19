@@ -4,3 +4,4 @@
 // Notes: mpd is the protocol client; more modules arrive slice by slice (store, podcasts, art)
 
 pub mod mpd;
+pub mod store;

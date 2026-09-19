@@ -7,6 +7,12 @@ description = "Music and podcasts on mpd for the Geist suite: CLI, TUI and the s
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
+dirs = "5"
+# feeds and downloads go through mg-brief's guarded network path (one hardened path for the suite)
+mg-brief = { path = "../mg-briefr" }
+# the version mg-brief links; two would clash over libsqlite3
+rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
