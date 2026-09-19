@@ -3,6 +3,7 @@
 // Description: mg-streamr — music and podcasts on mpd
 // Notes: mpd is the protocol client; more modules arrive slice by slice (store, podcasts, art)
 
+pub mod art;
 pub mod mpd;
 pub mod player;
 pub mod podcast;
