@@ -8,6 +8,7 @@ description = "Music and podcasts on mpd for the Geist suite: CLI, TUI and the s
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
 dirs = "5"
 # feeds and downloads go through mg-brief's guarded network path (one hardened path for the suite)
 mg-brief = { path = "../mg-briefr" }
