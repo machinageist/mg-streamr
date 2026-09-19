@@ -40,6 +40,46 @@ pub fn is_played(position: f64, duration: Option<i64>) -> bool {
     duration.is_some_and(|d| d > 0 && position >= d as f64 - PLAYED_WITHIN_SECONDS)
 }
 
+// What to record for a playing episode: (position, heard?), or nothing when stopped or at 0 —
+// a stop resets mpd's clock to 0, and saving that would lose where you were
+pub fn progress(state: &str, elapsed: f64, duration: Option<i64>) -> Option<(f64, bool)> {
+    if !(state == "play" || state == "pause") || elapsed <= 0.0 {
+        return None;
+    }
+    Some((elapsed, is_played(elapsed, duration)))
+}
+
+// how long to keep trying to seek a stream that is still opening
+const SEEK_TRIES: u32 = 12;
+const SEEK_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+// Play an episode: its download if there is one, else the stream; then pick up where it stopped
+pub fn play(store: &Store, mpd: &mut crate::mpd::Mpd, id: i64) -> Result<Episode> {
+    let episode = store.episode(id)?;
+    let uri = episode
+        .download_path
+        .clone()
+        .unwrap_or_else(|| episode.url.clone());
+    let added = mpd.run("addid", &[&uri])?;
+    let song_id = added
+        .iter()
+        .find(|(k, _)| k == "Id")
+        .map(|(_, v)| v.clone())
+        .context("mpd did not say where it queued the episode")?;
+    mpd.run("playid", &[&song_id])?;
+    if let Some(at) = resume_from(episode.position_seconds, episode.duration_seconds) {
+        // a stream cannot seek until it has opened; ask again for a few seconds
+        let at = format!("{at:.0}");
+        for _ in 0..SEEK_TRIES {
+            if mpd.run("seekcur", &[&at]).is_ok() {
+                break;
+            }
+            std::thread::sleep(SEEK_PAUSE);
+        }
+    }
+    Ok(episode)
+}
+
 // A playable file: http(s), and audio, video, or a type the feed did not say
 fn playable(url: &str, media_type: Option<&str>) -> bool {
     let web = url.starts_with("https://") || url.starts_with("http://");
@@ -225,6 +265,18 @@ mod tests {
             eps[1].guid, eps[1].url,
             "no guid → the file is the identity"
         );
+    }
+
+    #[test]
+    fn progress_is_recorded_only_while_playing_or_paused_past_zero() {
+        assert_eq!(progress("play", 600.0, Some(1800)), Some((600.0, false)));
+        assert_eq!(progress("pause", 1790.0, Some(1800)), Some((1790.0, true)));
+        assert_eq!(
+            progress("stop", 0.0, Some(1800)),
+            None,
+            "a stop must not wipe the spot"
+        );
+        assert_eq!(progress("play", 0.0, Some(1800)), None);
     }
 
     #[test]
