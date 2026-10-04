@@ -10,12 +10,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use mg_brief::feed::ParsedFeed;
+use mg_brief::feed::{ParsedFeed, sanitize_terminal_text};
 
 use crate::store::{Episode, NewEpisode, Show, Store};
 
-// a podcast feed with years of episodes can be large; nothing sensible is bigger
-const FEED_MAX_BYTES: u64 = 20 * 1024 * 1024;
+// podcast feeds can carry long histories; keep a hard ceiling with room for large daily feeds
+const FEED_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const FEED_TIMEOUT_SECONDS: u64 = 30;
 // an episode file (video episodes included)
 const EPISODE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -105,10 +105,20 @@ pub fn episodes_from(feed: &ParsedFeed) -> Vec<NewEpisode> {
                 published_at: entry.published.map(|d| d.to_rfc3339()),
                 duration_seconds: entry.duration_seconds.map(|d| d as i64),
                 image_url: entry.image_url.clone(),
-                summary: entry.summary.clone(),
+                summary: entry.summary.as_deref().map(sanitize_terminal_text),
             })
         })
         .collect()
+}
+
+// Save a fetched podcast feed after terminal-bound text has crossed the feed boundary.
+fn save_parsed_feed(store: &Store, name: &str, feed: &ParsedFeed) -> Result<usize> {
+    let episodes = episodes_from(feed);
+    if episodes.is_empty() {
+        bail!("{name}'s feed has no audio or video episodes")
+    }
+    let title = feed.title.as_deref().map(sanitize_terminal_text);
+    store.save_feed(name, title.as_deref(), feed.image_url.as_deref(), &episodes)
 }
 
 // Fetch a show's feed and store what it says; returns how many episodes are new
@@ -116,16 +126,7 @@ pub fn refresh(store: &Store, name: &str) -> Result<usize> {
     let show = store.show(name)?;
     let feed = mg_brief::fetch_feed_url(&show.feed_url, None, FEED_MAX_BYTES, FEED_TIMEOUT_SECONDS)
         .with_context(|| format!("reading {name}'s feed"))?;
-    let episodes = episodes_from(&feed);
-    if episodes.is_empty() {
-        bail!("{name}'s feed has no audio or video episodes")
-    }
-    store.save_feed(
-        name,
-        feed.title.as_deref(),
-        feed.image_url.as_deref(),
-        &episodes,
-    )
+    save_parsed_feed(store, name, &feed)
 }
 
 // Subscribe: record the show, then fetch it; a feed that fails leaves nothing behind

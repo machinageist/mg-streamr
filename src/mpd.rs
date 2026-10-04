@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use mg_brief::feed::sanitize_terminal_text;
 use serde::Serialize;
 
 const DEFAULT_TCP: &str = "127.0.0.1:6600";
@@ -124,7 +125,7 @@ pub fn parse_status(pairs: &[(String, String)]) -> Status {
         repeat: flag("repeat"),
         single: flag("single"),
         consume: flag("consume"),
-        error: get(pairs, "error").map(str::to_string),
+        error: get(pairs, "error").map(sanitize_terminal_text),
     }
 }
 
@@ -134,7 +135,7 @@ pub fn parse_songs(pairs: &[(String, String)]) -> Vec<Song> {
     for (key, value) in pairs {
         if key == "file" {
             songs.push(Song {
-                file: value.clone(),
+                file: sanitize_terminal_text(value),
                 ..Default::default()
             });
             continue;
@@ -143,10 +144,10 @@ pub fn parse_songs(pairs: &[(String, String)]) -> Vec<Song> {
             continue;
         };
         match key.as_str() {
-            "Title" => song.title = Some(value.clone()),
-            "Artist" => song.artist = Some(value.clone()),
-            "Album" => song.album = Some(value.clone()),
-            "Name" => song.name = Some(value.clone()),
+            "Title" => song.title = Some(sanitize_terminal_text(value)),
+            "Artist" => song.artist = Some(sanitize_terminal_text(value)),
+            "Album" => song.album = Some(sanitize_terminal_text(value)),
+            "Name" => song.name = Some(sanitize_terminal_text(value)),
             "duration" => song.duration = value.parse().ok(),
             "Pos" => song.pos = value.parse().ok(),
             "Id" => song.id = value.parse().ok(),
@@ -236,7 +237,7 @@ impl Mpd {
             if let Some(ack) = line.strip_prefix("ACK ") {
                 // "[50@0] {play} No such song" → "No such song"
                 let message = ack.split_once("} ").map_or(ack, |(_, m)| m);
-                bail!("mpd: {message}")
+                bail!("mpd: {}", sanitize_terminal_text(message))
             }
             if let Some((key, value)) = line.split_once(": ") {
                 pairs.push((key.to_string(), value.to_string()));
@@ -431,6 +432,25 @@ mod tests {
         assert_eq!(queue[1].name.as_deref(), Some("Show"));
         let err = mpd.run("play", &["9"]).unwrap_err();
         assert_eq!(err.to_string(), "mpd: Bad song index");
+    }
+
+    #[test]
+    fn mpd_display_fields_drop_terminal_controls_before_the_cli_can_print_them() {
+        let pairs = vec![
+            (
+                "file".into(),
+                "\u{1b}]8;;https://evil.test\u{7}song\u{1b}[0m".into(),
+            ),
+            ("Title".into(), "title\u{202e}spoof".into()),
+            ("Artist".into(), "artist\nnext-line".into()),
+            ("error".into(), "error\u{1b}[2J".into()),
+        ];
+        let song = parse_songs(&pairs).pop().expect("one song");
+        let status = parse_status(&pairs);
+        assert_eq!(song.file, "]8;;https://evil.testsong[0m");
+        assert_eq!(song.title.as_deref(), Some("titlespoof"));
+        assert_eq!(song.artist.as_deref(), Some("artistnext-line"));
+        assert_eq!(status.error.as_deref(), Some("error[2J"));
     }
 
     #[test]

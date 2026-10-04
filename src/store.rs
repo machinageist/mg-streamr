@@ -14,6 +14,8 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use crate::secure_db;
+
 const MIGRATIONS: &[&str] = &[
     "CREATE TABLE shows (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, feed_url TEXT NOT NULL UNIQUE, \
      title TEXT, image_url TEXT, added_at TEXT NOT NULL, refreshed_at TEXT); \
@@ -72,15 +74,29 @@ pub struct Store {
     path: PathBuf,
 }
 
-// $MG_STREAMR_DB, else the XDG data folder
+// Resolve the application-owned data directory without falling back to a relative path
+fn application_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("/var/empty"))
+        .join("mg-streamr")
+}
+
+// Accept an override only when it remains a database leaf in this application's data directory
+fn approved_database_override(candidate: PathBuf, directory: &Path) -> Option<PathBuf> {
+    (candidate.is_absolute()
+        && candidate.file_name().is_some_and(|name| !name.is_empty())
+        && candidate.parent() == Some(directory))
+    .then_some(candidate)
+}
+
+// $MG_STREAMR_DB may select a file name in the app directory, else use the XDG data folder
 pub fn default_path() -> PathBuf {
+    let directory = application_data_dir();
     std::env::var_os("MG_STREAMR_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("mg-streamr/streamr.sqlite")
-        })
+        .and_then(|candidate| approved_database_override(candidate, &directory))
+        .unwrap_or_else(|| directory.join("streamr.sqlite"))
 }
 
 // A show name is safe as a folder: letters, digits, dash, underscore, dot; not starting with a dot
@@ -135,15 +151,13 @@ impl Store {
     // Open (creating) the store and bring its schema up to date
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let store = Store { path };
         let mut c = store.conn()?;
         let mode: String = c.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             bail!("store could not switch to WAL (journal mode {mode})")
         }
+        secure_db::ensure_database_sidecars(&store.path)?;
         // the ledger and every pending migration in one write transaction
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
@@ -166,7 +180,8 @@ impl Store {
     }
 
     fn conn(&self) -> Result<Connection> {
-        let c = Connection::open(&self.path)
+        secure_db::prepare_database_path(&self.path)?;
+        let c = secure_db::open_database(&self.path)
             .with_context(|| format!("opening {}", self.path.display()))?;
         c.busy_timeout(Duration::from_secs(5))?;
         c.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -446,5 +461,75 @@ mod tests {
             .execute("INSERT INTO schema_migrations(version) VALUES (99)", [])
             .unwrap();
         assert!(Store::open(&path).is_err());
+    }
+
+    #[test]
+    fn configured_database_overrides_cannot_select_or_repermission_shared_parents() {
+        let directory = PathBuf::from("/home/test/.local/share/mg-streamr");
+        assert_eq!(
+            approved_database_override(directory.join("alternate.sqlite"), &directory),
+            Some(directory.join("alternate.sqlite"))
+        );
+        assert_eq!(
+            approved_database_override(
+                PathBuf::from("/home/test/shared/streamr.sqlite"),
+                &directory
+            ),
+            None
+        );
+        assert_eq!(
+            approved_database_override(PathBuf::from("streamr.sqlite"), &directory),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_is_private_repairs_modes_and_rejects_symlinks() {
+        use std::{
+            fs,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new/streamr.sqlite");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        let connection = store.conn().unwrap();
+        connection
+            .execute_batch("CREATE TABLE f03_probe (value INTEGER)")
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            assert!(sidecar.is_file(), "SQLite creates {suffix}");
+            assert_eq!(mode(&sidecar), 0o600, "{suffix} is owner-only");
+        }
+
+        let repaired_directory = root.path().join("repaired");
+        fs::create_dir(&repaired_directory).unwrap();
+        fs::set_permissions(&repaired_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let repaired_path = repaired_directory.join("streamr.sqlite");
+        fs::File::create(&repaired_path).unwrap();
+        fs::set_permissions(&repaired_path, fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(&repaired_path).unwrap();
+        assert_eq!(mode(&repaired_directory), 0o700);
+        assert_eq!(mode(&repaired_path), 0o600);
+
+        let target = root.path().join("target.sqlite");
+        let link = root.path().join("link.sqlite");
+        symlink(&target, &link).unwrap();
+        assert!(Store::open(&link).is_err());
+        assert!(
+            !target.exists(),
+            "SQLite never follows the protected database leaf"
+        );
     }
 }

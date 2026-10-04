@@ -28,9 +28,16 @@ mg-streamr tui                             # Now Playing, Queue, Library, Podcas
 - **mpd** is reached at `$MPD_HOST` if set, else `$XDG_RUNTIME_DIR/mpd/socket`, else
   127.0.0.1:6600. Arguments are quoted, and one containing a line break is refused.
 - **Podcasts** live in `$MG_STREAMR_DB` or `$XDG_DATA_HOME/mg-streamr/streamr.sqlite`. Feeds and
-  downloads go through mg-brief's guarded network path: SSRF checks, pinned DNS and size caps.
-  An episode resumes where it was left, except in the first 10 s or the last minute. The daemon
-  records the position every 10 s.
+  downloads go through mg-brief's guarded network path: SSRF checks and pinned DNS. Podcast feed
+  responses are capped at 32 MiB; episode downloads have a separate 2 GiB cap. An episode resumes
+  where it was left, except in the first 10 s or the last minute. The daemon records the position
+  every 10 s.
+- **Feed refresh** is separate from the position daemon. `mg-streamr-refresh.timer` refreshes all
+  subscribed shows every six hours, with a persistent catch-up after missed runs. Install units
+  with `geist-install --apply`, then enable the timer with
+  `systemctl --user daemon-reload && systemctl --user enable --now mg-streamr-refresh.timer`.
+  `mg-streamr podcast refresh [name]` remains available for manual refreshes; any failed feeds
+  produce a nonzero exit and a per-show result while other shows continue.
 - **Artwork** is cached in `$XDG_CACHE_HOME/mg-streamr/art/`. Music covers come from mpd;
   episode and show images come through the guarded download.
 

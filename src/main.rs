@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use mg_brief::feed::sanitize_terminal_text;
 use mg_streamr::art;
 use mg_streamr::mpd::{Mpd, Song, parse_songs};
 use mg_streamr::player::{self, Now};
@@ -25,6 +26,54 @@ const WATCHED: [&str; 4] = ["player", "mixer", "playlist", "options"];
 // pause before reconnecting after mpd goes away, so a stopped mpd is not hammered
 const RECONNECT_AFTER: Duration = Duration::from_secs(3);
 const DEFAULT_SEARCH_LIMIT: usize = 100;
+
+#[derive(Debug)]
+struct RefreshFailure {
+    report: serde_json::Value,
+    message: String,
+}
+
+impl std::fmt::Display for RefreshFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RefreshFailure {}
+
+fn finish_refresh(results: Vec<serde_json::Value>) -> Result<(serde_json::Value, String)> {
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|result| {
+            let error = result.get("error")?.as_str()?;
+            let show = result
+                .get("show")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            Some(format!("{show}: {error}"))
+        })
+        .collect();
+    let report = json!({ "ok": failures.is_empty(), "results": results });
+    if !failures.is_empty() {
+        return Err(RefreshFailure {
+            report,
+            message: format!(
+                "{} podcast feed(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        }
+        .into());
+    }
+    let text = report["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((report, text))
+}
 
 #[derive(Parser)]
 #[command(name = "mg-streamr", version, about = "Music and podcasts on mpd")]
@@ -155,10 +204,16 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if json {
+            if let Some(refresh) = e.downcast_ref::<RefreshFailure>() {
+                if json {
+                    println!("{}", refresh.report);
+                } else {
+                    eprintln!("mg-streamr: {}", sanitize_terminal_text(&refresh.message));
+                }
+            } else if json {
                 println!("{}", json!({ "ok": false, "error": format!("{e:#}") }));
             } else {
-                eprintln!("mg-streamr: {e:#}");
+                eprintln!("mg-streamr: {}", sanitize_terminal_text(&format!("{e:#}")));
             }
             ExitCode::FAILURE
         }
@@ -192,7 +247,7 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 println!("{}", json!({ "art": now.art }));
             } else if let Some(path) = now.art {
-                println!("{path}");
+                println!("{}", sanitize_terminal_text(&path));
             }
             Ok(())
         }
@@ -242,10 +297,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Library { action } => match action {
             LibraryAction::Browse { dir } => {
                 let pairs = mpd.run("lsinfo", &[&dir])?;
-                let folders: Vec<&str> = pairs
+                let folders: Vec<String> = pairs
                     .iter()
                     .filter(|(k, _)| k == "directory")
-                    .map(|(_, v)| v.as_str())
+                    .map(|(_, v)| sanitize_terminal_text(v))
                     .collect();
                 let songs = parse_songs(&pairs);
                 if json {
@@ -293,7 +348,7 @@ fn podcast(json: bool, action: PodcastAction) -> Result<()> {
         if json {
             println!("{value}");
         } else {
-            println!("{text}");
+            println!("{}", sanitize_terminal_text(&text));
         }
     };
     match action {
@@ -315,10 +370,13 @@ fn podcast(json: bool, action: PodcastAction) -> Result<()> {
                 for s in &shows {
                     println!(
                         "{:<20} {:>4} episodes, {:>3} new  {}",
-                        s.name,
+                        sanitize_terminal_text(&s.name),
                         s.episodes,
                         s.unplayed,
-                        s.title.as_deref().unwrap_or("")
+                        s.title
+                            .as_deref()
+                            .map(sanitize_terminal_text)
+                            .unwrap_or_default()
                     );
                 }
             }
@@ -336,14 +394,8 @@ fn podcast(json: bool, action: PodcastAction) -> Result<()> {
                     Err(e) => results.push(json!({ "show": n, "error": format!("{e:#}") })),
                 }
             }
-            print(
-                json!({ "ok": true, "results": results }),
-                results
-                    .iter()
-                    .map(|r| r.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
+            let (report, text) = finish_refresh(results)?;
+            print(report, text);
         }
         PodcastAction::Episodes { name, limit } => {
             let episodes = store.episodes(&name, limit)?;
@@ -362,7 +414,11 @@ fn podcast(json: bool, action: PodcastAction) -> Result<()> {
                     } else {
                         ""
                     };
-                    println!("{mark} {:>6}  {}{at}{saved}", e.id, e.title);
+                    println!(
+                        "{mark} {:>6}  {}{at}{saved}",
+                        e.id,
+                        sanitize_terminal_text(&e.title)
+                    );
                 }
             }
         }
@@ -485,7 +541,11 @@ fn show_now(json: bool, now: &Now) -> Result<()> {
     if now.state == "stop" && now.title.is_empty() {
         println!("{mark} stopped{volume}");
     } else {
-        println!("{mark} {who}{}  {time}{volume}", now.title);
+        println!(
+            "{mark} {}{}  {time}{volume}",
+            sanitize_terminal_text(&who),
+            sanitize_terminal_text(&now.title)
+        );
     }
     Ok(())
 }
@@ -508,8 +568,12 @@ fn print_songs(songs: &[Song]) {
             .or_else(|| s.name.clone())
             .unwrap_or_else(|| s.file.clone());
         match &s.artist {
-            Some(a) => println!("{pos}{a} \u{2014} {title}"),
-            None => println!("{pos}{title}"),
+            Some(a) => println!(
+                "{pos}{} \u{2014} {}",
+                sanitize_terminal_text(a),
+                sanitize_terminal_text(&title)
+            ),
+            None => println!("{pos}{}", sanitize_terminal_text(&title)),
         }
     }
 }
@@ -542,5 +606,32 @@ fn watch() -> Result<()> {
             }
         }
         std::thread::sleep(RECONNECT_AFTER);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_refresh_is_a_structured_failure_for_service_managers() {
+        let error = finish_refresh(vec![
+            json!({ "show": "working", "added": 2 }),
+            json!({ "show": "offline", "error": "timeout" }),
+        ])
+        .unwrap_err();
+        let failure = error.downcast_ref::<RefreshFailure>().unwrap();
+        assert_eq!(failure.report["ok"], false);
+        assert_eq!(failure.report["results"][1]["error"], "timeout");
+        assert!(failure.to_string().contains("offline: timeout"));
+    }
+
+    #[test]
+    fn fully_successful_refresh_keeps_the_existing_report_shape() {
+        let (report, text) =
+            finish_refresh(vec![json!({ "show": "working", "added": 2 })]).unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["results"][0]["added"], 2);
+        assert!(text.contains("\"working\""));
     }
 }

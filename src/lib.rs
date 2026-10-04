@@ -7,5 +7,6 @@ pub mod art;
 pub mod mpd;
 pub mod player;
 pub mod podcast;
+mod secure_db;
 pub mod store;
 pub mod tui;
